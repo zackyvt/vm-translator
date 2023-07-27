@@ -1,0 +1,12 @@
+@261
+D=A
+@SP
+M=D
+@LCL
+M=D
+@256
+D=A
+@ARG
+M=D
+@Sys.init
+0;JMP

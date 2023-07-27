@@ -3,28 +3,47 @@ use std::fs;
 use std::path::Path;
 
 /// A VM instruction is represented here
+#[derive(Clone)]
 struct Instruction<'a> {
     operation: &'a str,
     arg1: Option<&'a str>,
     arg2: Option<&'a str>,
     raw: &'a str,
-    filename: &'a str,
+    file: &'a str,
     id: usize,
+    frame: Option<&'a str>,
 }
 
 impl<'a> Instruction<'a> {
     /// Given an instruction string (with whitespaces and comments removed),
     /// returns a new Instruction
-    fn new(s: &'a str, id: usize, filename: &'a str) -> Result<Self, &'static str> {
+    fn new(s: &'a str, id: usize, file: &'a str) -> Result<Self, &'static str> {
         let mut parts = s.split(" ");
         Ok(Self {
             raw: s,
-            operation: parts.next().ok_or("Invalid syntax for VM instruction")?,
+            operation: parts.next().ok_or("Unable to parse empty line")?,
             arg1: parts.next(),
             arg2: parts.next(),
-            filename,
+            file,
             id,
+            frame: None,
         })
+    }
+
+    /// Given a vector of instructions, set the frame field of self
+    fn set_frame(&mut self, instructions: &Vec<Instruction<'a>>) {
+        let get_frame = || match self.operation {
+            "operation" => self.arg1,
+            _ => {
+                instructions
+                    .iter()
+                    .filter(|x| x.operation == "function")
+                    .filter(|x| x.id < self.id)
+                    .last()?
+                    .arg1
+            }
+        };
+        self.frame = get_frame();
     }
 }
 
@@ -69,7 +88,7 @@ fn segment_fmt(opt: MemOpType, instruction: &Instruction) -> Result<String, Stri
 /// Return the formatted code for a static segment push/pop VM instruction
 fn static_fmt(opt: MemOpType, instruction: &Instruction) -> Result<String, String> {
     let arg =
-        instruction.filename.to_string() + "." + instruction.arg2.ok_or("Missing 2nd argument")?;
+        instruction.file.to_string() + "." + instruction.arg2.ok_or("Missing 2nd argument")?;
     Ok(match opt {
         MemOpType::Push => format!(include_str!("./translations/push/direct.asm"), arg),
         MemOpType::Pop => format!(include_str!("./translations/pop/direct_full.asm"), arg),
@@ -180,11 +199,10 @@ fn generate_1op(instruction: &Instruction) -> Result<String, String> {
 /// Return the Hack assembly representation of the logical comparison VM instructions
 /// (eq, gt, lt)
 fn generate_cmp(instruction: &Instruction) -> Result<String, String> {
-    let identifier = instruction.filename.to_string() + "." + &instruction.id.to_string() + ".";
     let g = |x| {
         Ok(format!(
             include_str!("./translations/cmp/main.asm"),
-            identifier, x, identifier, identifier, identifier, identifier
+            instruction.id, x, instruction.id, instruction.id, instruction.id, instruction.id
         ))
     };
     match instruction.operation {
@@ -193,6 +211,66 @@ fn generate_cmp(instruction: &Instruction) -> Result<String, String> {
         "lt" => g("JLT"),
         o @ _ => Err(format!("Invalid logical comparison instruction '{}'", o)),
     }
+}
+
+/// Returns the Hack assembly representation of the branching VM instructions
+/// (label, goto, if-goto)
+fn generate_branching(instruction: &Instruction) -> Result<String, String> {
+    let l_name = instruction.file.to_string()
+        + "."
+        + instruction.frame.unwrap_or("global")
+        + "$"
+        + instruction.arg1.ok_or("Missing label name argument")?;
+    Ok(match instruction.operation {
+        "label" => format!("({})\n", l_name),
+        "goto" => format!("@{}\n0;JMP\n", l_name),
+        "if-goto" => format!(include_str!("./translations/branching/if-goto.asm"), l_name),
+        o @ _ => Err(format!("Invalid branching instruction '{}'", o))?,
+    })
+}
+
+/// Returns the Hack assembly representation of the functions VM instructions
+/// (function, call, return)
+fn generate_functions(instruction: &Instruction) -> Result<String, String> {
+    Ok(match instruction.operation {
+        "function" => {
+            let arg1 = instruction.arg1.ok_or("Missing function name argument")?;
+            let arg2 = instruction
+                .arg2
+                .ok_or("Missing n_vars argument for function")?;
+            let n_vars = arg2.parse::<usize>().or(Err(format!(
+                "Invalid n_vars argument for function, '{}'",
+                arg2
+            )))?;
+            format!(
+                include_str!("./translations/functions/function.asm"),
+                arg1,
+                n_vars,
+                "M=0\nA=A+1\n".repeat(n_vars)
+            )
+        }
+        "call" => {
+            let arg1 = instruction
+                .arg1
+                .ok_or("Missing function name argument to call")?;
+            let arg2 = instruction
+                .arg2
+                .ok_or("Missing n_args argument for function call")?;
+            let n_args = arg2.parse::<usize>().or(Err(format!(
+                "Invalid n_args argument for function call, '{}",
+                arg2
+            )))?;
+
+            let return_label =
+                instruction.frame.unwrap_or("global").to_string()
+                + "$ret."
+                + &instruction.id.to_string();
+            
+            format!(include_str!("./translations/functions/call.asm"), return_label, n_args + 5, arg1, return_label)
+        }
+        "return" => include_str!("./translations/functions/return.asm").to_string(),
+        o @ _ => Err(format!("Invalid functions instruction '{}'", o))?,
+    })
 }
 
 /// Returns the Hack assembly representation of the VM instruction
@@ -210,16 +288,34 @@ fn generate_code(instruction: &Instruction) -> Result<String, String> {
         "add" | "sub" | "and" | "or" => g(generate_2op),
         "neg" | "not" => g(generate_1op),
         "eq" | "gt" | "lt" => g(generate_cmp),
+        "label" | "goto" | "if-goto" => g(generate_branching),
+        "function" | "call" | "return" => g(generate_functions),
         o @ _ => Err(err_fmt(format!("Invalid VM instruction '{}'", o))),
     }
 }
 
-/// Given the contents of a .vm file, return the translated Hack assembly code
-fn translate(contents: &str, filename: &str) -> Result<String, Vec<String>> {
-    let res = parse_contents(contents)
+/// Given a vector of tuples of a VM filename and its contents,
+/// return the translated Hack assembly code
+fn translate(contents: Vec<(String, String)>) -> Result<String, Vec<String>> {
+    let instructions = contents
         .iter()
-        .enumerate()
-        .map(|(i, x)| generate_code(&(Instruction::new(x, i, filename).unwrap())))
+        .map(|(file, c)| {
+            parse_contents(c)
+                .iter()
+                .enumerate()
+                .map(|(i, x)| Instruction::new(x, i, file).unwrap())
+                .collect::<Vec<Instruction>>()
+        })
+        .flatten()
+        .collect::<Vec<Instruction>>();
+    let instructions_clone = instructions.clone();
+    let res = instructions
+        .into_iter()
+        .map(|mut x| {
+            x.set_frame(&instructions_clone);
+            x
+        })
+        .map(|x| generate_code(&x))
         .fold((vec![], vec![]), |(mut o, mut e), item| match item {
             Ok(v) => {
                 o.push(v);
@@ -231,28 +327,57 @@ fn translate(contents: &str, filename: &str) -> Result<String, Vec<String>> {
             }
         });
     match res.1.len() {
-        0 => Ok(res
-            .0
-            .iter()
-            .fold(String::new(), |acc, item| acc + &item + "\n\n")),
+        0 => Ok(include_str!("./translations/init.asm").to_string()
+            + &res
+                .0
+                .iter()
+                .fold(String::new(), |acc, item| acc + &item + "\n\n")),
         _ => Err(res.1),
     }
 }
 
 fn main() {
-    let input_path = env::args().nth(1).expect("Path to .vm file not specified");
-    assert!(input_path.ends_with(".vm"), "Input file has to be a .vm file");
-    let filename = Path::new(&input_path)
-        .file_stem()
-        .unwrap()
-        .to_str()
-        .unwrap();
-    let contents = fs::read_to_string(&input_path).unwrap();
-    match translate(&contents, &filename) {
+    let input_path = env::args()
+        .nth(1)
+        .expect("Path to .vm file or directory not specified");
+    let p = Path::new(&input_path);
+    let contents = {
+        if p.is_file() {
+            assert!(
+                p.extension().unwrap() == "vm",
+                "Input file has to be a .vm file or a directory"
+            );
+            vec![(
+                p.file_stem().unwrap().to_str().unwrap().to_owned(),
+                fs::read_to_string(p).unwrap(),
+            )]
+        } else if p.is_dir() {
+            fs::read_dir(&p)
+                .unwrap()
+                .map(|e| e.unwrap())
+                .map(|e| e.path())
+                .filter(|p| p.extension().unwrap_or_default() == "vm")
+                .map(|p| (p.file_stem().unwrap().to_str().unwrap().to_owned(), p))
+                .map(|(n, p)| (n, fs::read_to_string(p).unwrap()))
+                .collect()
+        } else {
+            panic!("Input path is neither a file nor a directory")
+        }
+    };
+    match translate(contents) {
         Ok(v) => {
-            let output_path = input_path.replace(".vm", ".asm");
+            let output_path = if p.is_file() {
+                input_path.replace(".vm", ".asm")
+            } else {
+                let mut path_buff = p.to_owned().to_path_buf();
+                path_buff.push(p.file_name().unwrap().to_str().unwrap().to_owned() + ".asm");
+                path_buff.to_str().unwrap().to_owned()
+            };
             fs::write(&output_path, v).unwrap();
-            println!("Successfully translated {}.vm into {}", &filename, output_path);
+            println!(
+                "Successfully translated {} into {}",
+                p.file_name().unwrap().to_str().unwrap(), output_path
+            );
         }
         Err(v) => {
             eprintln!(

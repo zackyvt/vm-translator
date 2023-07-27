@@ -1,0 +1,13 @@
+function Sys.init 0
+    push constant 2
+    push constant 3
+    call add_three 2
+    label loop
+    goto loop
+return
+
+function add_three 2
+    push argument 1
+    push argument 0
+    add
+return
